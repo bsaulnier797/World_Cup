@@ -18,6 +18,9 @@ import itertools
 import numpy as np
 import pandas as pd
 
+from scipy.optimize import minimize
+from scipy.special import gammaln
+
 try:
     import cvxpy as cp
     HAVE_CVXPY = True
@@ -168,6 +171,137 @@ def match_probabilities(r_home, r_away, neutral=True,
     p_home = we - p_draw / 2.0
     p_away = 1.0 - we - p_draw / 2.0
     return float(p_home), float(p_draw), float(p_away)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 3b: DIXON-COLES SCORELINE MODEL  (the better predictor)
+# ---------------------------------------------------------------------------
+# Instead of forcing one Elo number into three outcomes with a hand-built draw
+# rule, model the GOALS each side scores as Poisson, driven by the Elo gap, with
+# the Dixon-Coles low-score correction. Home/draw/away then fall out of the score
+# matrix, and you get exact-scoreline and over/under probabilities for free.
+#
+#   log(lambda_home) = a + b * (elo_diff / 100) + h * (plays_at_home)
+#   log(lambda_away) = a - b * (elo_diff / 100)
+# where elo_diff is the venue-neutral strength gap. The 4 parameters (a, b, h,
+# rho) are fit once by maximum likelihood -- few parameters, so not overfit-prone.
+
+def _poisson_logpmf(k, lam):
+    lam = np.maximum(lam, 1e-10)
+    return k * np.log(lam) - lam - gammaln(k + 1.0)
+
+
+def _dc_tau(hg, ag, lh, la, rho):
+    """Dixon-Coles low-score correction on the (0/1 x 0/1) cells; 1 elsewhere."""
+    tau = np.ones_like(lh, dtype=float)
+    tau = np.where((hg == 0) & (ag == 0), 1.0 - lh * la * rho, tau)
+    tau = np.where((hg == 0) & (ag == 1), 1.0 + lh * rho, tau)
+    tau = np.where((hg == 1) & (ag == 0), 1.0 + la * rho, tau)
+    tau = np.where((hg == 1) & (ag == 1), 1.0 - rho, tau)
+    return tau
+
+
+def fit_scoreline_model(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
+    """
+    Fit the Dixon-Coles + Elo-covariate goals model by maximum likelihood.
+    Walks Elo point-in-time so each match's covariate uses only prior info.
+    Returns a params dict {a, b, h, rho} for use with predict_scoreline().
+    """
+    ratings = {}
+    d_list, venue_list, hg_list, ag_list = [], [], [], []
+
+    for row in train_df.itertuples(index=False):
+        h, a = row.home_team, row.away_team
+        rh = ratings.get(h, BASE_RATING)
+        ra = ratings.get(a, BASE_RATING)
+        neutral = _is_neutral(row.neutral)
+
+        d_list.append((rh - ra) / 100.0)          # venue-neutral strength gap
+        venue_list.append(0.0 if neutral else 1.0)
+        hg_list.append(int(row.home_score))
+        ag_list.append(int(row.away_score))
+
+        new_rh, new_ra = update_elo(rh, ra, row.home_score, row.away_score,
+                                    tournament=row.tournament, neutral=neutral,
+                                    home_advantage=home_advantage)
+        ratings[h], ratings[a] = new_rh, new_ra
+
+    d = np.array(d_list); venue = np.array(venue_list)
+    hg = np.array(hg_list); ag = np.array(ag_list)
+
+    def neg_log_likelihood(theta):
+        a_, b_, h_, rho_ = theta
+        lh = np.exp(a_ + b_ * d + h_ * venue)
+        la = np.exp(a_ - b_ * d)
+        tau = np.maximum(_dc_tau(hg, ag, lh, la, rho_), 1e-10)
+        ll = _poisson_logpmf(hg, lh) + _poisson_logpmf(ag, la) + np.log(tau)
+        return -np.sum(ll)
+
+    x0 = np.array([0.2, 0.3, 0.25, -0.05])
+    bounds = [(-1.0, 1.0), (0.0, 2.0), (-0.5, 1.0), (-0.2, 0.2)]
+    res = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds)
+    a_, b_, h_, rho_ = res.x
+    return {"a": float(a_), "b": float(b_), "h": float(h_), "rho": float(rho_)}
+
+
+def predict_scoreline(r_home, r_away, params, neutral=True, max_goals=10):
+    """
+    Full prediction from the fitted goals model. Returns a dict with H/D/A
+    probabilities, expected goals for each side, and the most likely scoreline.
+    """
+    d = (r_home - r_away) / 100.0
+    venue = 0.0 if neutral else 1.0
+    lh = float(np.exp(params["a"] + params["b"] * d + params["h"] * venue))
+    la = float(np.exp(params["a"] - params["b"] * d))
+
+    i = np.arange(0, max_goals + 1)
+    ph = np.exp(_poisson_logpmf(i, lh))           # P(home scores i)
+    pa = np.exp(_poisson_logpmf(i, la))           # P(away scores j)
+    matrix = np.outer(ph, pa)                     # matrix[i, j]
+
+    rho = params["rho"]
+    matrix[0, 0] *= 1.0 - lh * la * rho
+    matrix[0, 1] *= 1.0 + lh * rho
+    matrix[1, 0] *= 1.0 + la * rho
+    matrix[1, 1] *= 1.0 - rho
+    matrix = np.maximum(matrix, 0.0)
+    matrix /= matrix.sum()
+
+    p_home = float(np.tril(matrix, -1).sum())     # home goals > away goals
+    p_away = float(np.triu(matrix, 1).sum())      # away goals > home goals
+    p_draw = float(np.trace(matrix))
+    best = np.unravel_index(np.argmax(matrix), matrix.shape)
+
+    return {
+        "p_home": p_home, "p_draw": p_draw, "p_away": p_away,
+        "exp_home_goals": lh, "exp_away_goals": la,
+        "likely_score": (int(best[0]), int(best[1])),
+    }
+
+
+def match_probabilities_dc(r_home, r_away, params, neutral=True):
+    """Drop-in (P_home, P_draw, P_away) from the Dixon-Coles model."""
+    r = predict_scoreline(r_home, r_away, params, neutral=neutral)
+    return r["p_home"], r["p_draw"], r["p_away"]
+
+
+# ---------------------------------------------------------------------------
+# PROPER SCORING RULES  (to prove one model beats another)
+# ---------------------------------------------------------------------------
+
+def log_loss(p_home, p_draw, p_away, outcome):
+    """Negative log of the probability assigned to what actually happened."""
+    p = {"Home": p_home, "Draw": p_draw, "Away": p_away}[outcome]
+    return -np.log(max(p, 1e-12))
+
+
+def rps(p_home, p_draw, p_away, outcome):
+    """Ranked Probability Score for ordered outcomes (Home, Draw, Away)."""
+    preds = np.array([p_home, p_draw, p_away])
+    obs = np.array([1.0 if outcome == o else 0.0 for o in ("Home", "Draw", "Away")])
+    cum_p = np.cumsum(preds)
+    cum_o = np.cumsum(obs)
+    return float(np.sum((cum_p[:-1] - cum_o[:-1]) ** 2) / (len(preds) - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +569,16 @@ if __name__ == "__main__":
     for h, a in [("Spain", "Cape Verde"), ("Belgium", "Egypt")]:
         ph, pd_, pa = match_probabilities(ratings[h], ratings[a])
         print(f"  {h} vs {a}: H={ph:.0%} D={pd_:.0%} A={pa:.0%} (sum={ph+pd_+pa:.3f})")
+
+    print("=" * 60)
+    print("PHASE 3b: Dixon-Coles scoreline model")
+    params = fit_scoreline_model(train)
+    print(f"  fitted: a={params['a']:.3f} b={params['b']:.3f} h={params['h']:.3f} rho={params['rho']:.3f}")
+    for h, a in [("Spain", "Cape Verde"), ("Belgium", "Egypt")]:
+        r = predict_scoreline(ratings[h], ratings[a], params, neutral=True)
+        print(f"  {h} vs {a}: H={r['p_home']:.0%} D={r['p_draw']:.0%} A={r['p_away']:.0%}"
+              f"  | likely score {r['likely_score'][0]}-{r['likely_score'][1]}"
+              f"  (xG {r['exp_home_goals']:.1f}-{r['exp_away_goals']:.1f})")
 
     print("=" * 60)
     print("PHASE 6: Kelly")
