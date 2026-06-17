@@ -30,21 +30,25 @@ def load_model(home_advantage):
     df = m.load_results()
     train = m.get_training_data(df)
     ratings, _ = m.compute_elo(train, home_advantage=home_advantage)
+    offsets = m.fit_confederation_offsets(train, ratings)
+    ratings_adj = m.apply_confederation_offsets(ratings, offsets)
     params, cov, _ = m.fit_scoreline_model_with_cov(train, home_advantage=home_advantage)
-    return df, train, ratings, params, cov
+    return df, train, ratings_adj, offsets, params, cov
 
 
 @st.cache_data(ttl=1800, show_spinner="Scoring the model's track record...")
 def accuracy(home_advantage):
-    _df, train, _ratings, params, _cov = load_model(home_advantage)
-    current = m.tournament_accuracy(train, params, year=2026, home_advantage=home_advantage)
-    all_time = m.tournament_accuracy(train, params, year=None, home_advantage=home_advantage)
+    _df, train, _radj, offsets, params, _cov = load_model(home_advantage)
+    current = m.tournament_accuracy(train, params, year=2026,
+                                    home_advantage=home_advantage, conf_offsets=offsets)
+    all_time = m.tournament_accuracy(train, params, year=None,
+                                     home_advantage=home_advantage, conf_offsets=offsets)
     return current, all_time
 
 
 @st.cache_data(ttl=1800, show_spinner="Running inference...")
-def predictions_for(home_advantage, ci, day_str):
-    df, train, ratings, params, cov = load_model(home_advantage)
+def predictions_for(home_advantage, ci, day_str, bet_threshold):
+    df, train, ratings, offsets, params, cov = load_model(home_advantage)
     fixtures = m.get_fixtures_for_date(df, day_str)
     out, skipped = [], []
     for r in fixtures.itertuples(index=False):
@@ -55,7 +59,7 @@ def predictions_for(home_advantage, ci, day_str):
             ratings[r.home_team], ratings[r.away_team], params, cov,
             neutral=m._is_neutral(r.neutral),
             home_name=r.home_team, away_name=r.away_team,
-            ci=ci, n_samples=2000)
+            ci=ci, n_samples=2000, bet_threshold=bet_threshold)
         out.append(res)
     return out, skipped
 
@@ -69,6 +73,9 @@ home_adv = st.sidebar.slider("Home advantage (Elo pts)", 0, 150, 100, 10,
     help="Applied only to host nations USA, Mexico, Canada at home.")
 ci_pct = st.sidebar.select_slider("Confidence level", options=[90, 95, 99], value=95)
 ci = ci_pct / 100.0
+bet_threshold = st.sidebar.slider("Only flag a bet above this win chance", 0.55, 0.85, 0.65, 0.01,
+    help="A bet is flagged only when the model is confident the winner's chance clears "
+         "this AND a draw is unlikely AND the gap is statistically significant. Default 65%.")
 if st.sidebar.button("Refresh data"):
     st.cache_data.clear()
 
@@ -80,7 +87,7 @@ if st.sidebar.button("Refresh data"):
 st.title("⚽ World Cup 2026 — Who Wins, and How Sure Are We?")
 st.caption("Win probability, a confidence interval, and a significance test for each match.")
 
-df, train, ratings, params, cov = load_model(float(home_adv))
+df, train, ratings, offsets, params, cov = load_model(float(home_adv))
 
 # --- model win rate, shown at the top ---
 current, all_time = accuracy(float(home_adv))
@@ -113,7 +120,7 @@ else:
                        options, format_func=lambda d: f"{d:%A, %B %d}")
     st.subheader(f"{day:%A, %B %d, %Y}")
 
-results, skipped = predictions_for(float(home_adv), ci, pd.Timestamp(day).strftime("%Y-%m-%d"))
+results, skipped = predictions_for(float(home_adv), ci, pd.Timestamp(day).strftime("%Y-%m-%d"), float(bet_threshold))
 if skipped:
     st.warning("No rating data for: " + ", ".join(skipped))
 if not results:
@@ -131,13 +138,19 @@ def pfmt(p):
 rows = []
 for res in results:
     lo, hi = res["prob_ci"]
+    if res["recommend_bet"]:
+        bet_cell = f"✅ Bet {res['winner']}"
+    elif res["too_close"]:
+        bet_cell = "Too close to call"
+    else:
+        bet_cell = "—"
     rows.append({
         "Match": f"{res['home_name']} vs {res['away_name']}",
         "Predicted winner": res["winner"],
         "P(win)": res["winner_prob"],
         f"{ci_pct}% CI": f"{lo:.0%} – {hi:.0%}",
         "p-value": pfmt(res["p_value"]),
-        "Significant?": "Yes" if res["significant"] else "No",
+        "Bet?": bet_cell,
     })
 st.dataframe(
     pd.DataFrame(rows).style.format({"P(win)": "{:.0%}"}),
@@ -177,6 +190,17 @@ for res in results:
             st.info("Not significant (p ≥ 0.05): the two teams are too evenly matched "
                     "to call one genuinely stronger.")
 
+        if res["recommend_bet"]:
+            st.markdown(f"### ✅ Bet: {res['winner']}")
+            st.caption(res["bet_reason"])
+        elif res["too_close"]:
+            st.markdown("### ⚖️ Too close to call — no bet")
+            st.caption(res["bet_reason"] + f" (need {res['bet_threshold']:.0%}+ win chance, "
+                       f"low draw risk, and significance).")
+        else:
+            st.markdown("### — No bet")
+            st.caption(res["bet_reason"])
+
         st.write(
             f"Full probabilities — **{home} {res['p_home']:.0%}**, "
             f"**Draw {res['p_draw']:.0%}**, **{away} {res['p_away']:.0%}**. "
@@ -213,10 +237,22 @@ That's the **confidence interval** and the **p-value**. Because the model is fit
   real strength gap**. "Significant" means the gap is statistically real, **not** that the
   outcome is certain.
 
-**Method.** Win probabilities come from a Dixon-Coles goals model driven by Elo ratings.
-The confidence interval and p-value are produced by sampling plausible model parameters
-from their estimated covariance (the inverse Hessian of the likelihood at the fit) and
-recomputing the prediction. The margin range comes from the predictive score distribution.
+**Method.** Win probabilities come from a Dixon-Coles goals model driven by Elo ratings,
+with a **confederation adjustment** (a data-driven offset, fit from cross-confederation
+results, that corrects Elo's tendency to over-rate teams from weaker confederations who
+rarely play the strong ones). The confidence interval and p-value are produced by sampling
+plausible model parameters from their estimated covariance (the inverse Hessian of the
+likelihood at the fit) and recomputing the prediction. The margin range comes from the
+predictive score distribution.
+
+**A bet is flagged** only when all of these hold: the winner's win chance clears the
+threshold (both the point estimate and the lower confidence bound), a draw is unlikely
+(< 25%), and the strength gap is statistically significant. Most group-stage games are
+genuinely close, so most read "too close to call" — which is the honest answer.
+
+**What didn't make the cut:** recency weighting (down-weighting older matches) was tested
+and *reduced* World Cup accuracy — 56% to 52% on 984 matches — because the lost sample size
+costs more than the gained freshness. It's left in the code as an off-by-default option.
 
 **One honest limitation:** the confidence interval reflects uncertainty in the *global
 model parameters*, not in the two teams' individual Elo ratings — so for teams with very

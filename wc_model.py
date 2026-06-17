@@ -53,6 +53,146 @@ K_BY_TOURNAMENT = {
 }
 K_DEFAULT = 30
 
+# Recency (OPT-IN, default OFF). Decaying old matches toward neutral was tested
+# and found to REDUCE World Cup prediction accuracy (56% -> 52% on 984 matches),
+# because the lost sample size costs more than the gained freshness. Left as a
+# tunable knob: pass half_life=730 (2-yr) to compute_elo / the fits to enable it.
+RATING_HALFLIFE_DAYS = 730.0
+
+
+def _regress_to_mean(rating, days_since_last, half_life=None):
+    """Pull a rating toward 1500 by time since the team last played. Off if None."""
+    if half_life is None or days_since_last <= 0:
+        return rating
+    factor = 0.5 ** (days_since_last / half_life)
+    return BASE_RATING + (rating - BASE_RATING) * factor
+
+
+def _recency_weight(match_date, as_of, half_life=None):
+    """Fit weight for a match: 1.0 today, halving every `half_life` days. Off if None."""
+    if half_life is None:
+        return 1.0
+    days = (pd.Timestamp(as_of) - pd.Timestamp(match_date)).days
+    return 0.5 ** (max(days, 0) / half_life)
+
+
+# Confederation of each national team (major sides; unknown -> no adjustment).
+CONFEDERATIONS = {
+    # UEFA
+    "Spain": "UEFA", "France": "UEFA", "England": "UEFA", "Germany": "UEFA",
+    "Netherlands": "UEFA", "Portugal": "UEFA", "Italy": "UEFA", "Belgium": "UEFA",
+    "Croatia": "UEFA", "Denmark": "UEFA", "Switzerland": "UEFA", "Austria": "UEFA",
+    "Poland": "UEFA", "Ukraine": "UEFA", "Serbia": "UEFA", "Sweden": "UEFA",
+    "Wales": "UEFA", "Scotland": "UEFA", "Norway": "UEFA", "Czech Republic": "UEFA",
+    "Turkey": "UEFA", "Hungary": "UEFA", "Republic of Ireland": "UEFA",
+    "Slovakia": "UEFA", "Slovenia": "UEFA", "Greece": "UEFA", "Romania": "UEFA",
+    "Iceland": "UEFA", "Finland": "UEFA", "Albania": "UEFA", "North Macedonia": "UEFA",
+    "Bosnia and Herzegovina": "UEFA", "Georgia": "UEFA", "Russia": "UEFA",
+    # CONMEBOL
+    "Brazil": "CONMEBOL", "Argentina": "CONMEBOL", "Uruguay": "CONMEBOL",
+    "Colombia": "CONMEBOL", "Chile": "CONMEBOL", "Peru": "CONMEBOL",
+    "Ecuador": "CONMEBOL", "Paraguay": "CONMEBOL", "Bolivia": "CONMEBOL",
+    "Venezuela": "CONMEBOL",
+    # CONCACAF
+    "United States": "CONCACAF", "Mexico": "CONCACAF", "Canada": "CONCACAF",
+    "Costa Rica": "CONCACAF", "Panama": "CONCACAF", "Jamaica": "CONCACAF",
+    "Honduras": "CONCACAF", "El Salvador": "CONCACAF", "Guatemala": "CONCACAF",
+    "Haiti": "CONCACAF", "Trinidad and Tobago": "CONCACAF", "Curacao": "CONCACAF",
+    # AFC
+    "Japan": "AFC", "South Korea": "AFC", "Korea Republic": "AFC", "Iran": "AFC",
+    "Australia": "AFC", "Saudi Arabia": "AFC", "Qatar": "AFC", "Iraq": "AFC",
+    "United Arab Emirates": "AFC", "Uzbekistan": "AFC", "Jordan": "AFC",
+    "China PR": "AFC", "Oman": "AFC", "Bahrain": "AFC", "Vietnam": "AFC",
+    "Thailand": "AFC", "India": "AFC", "Syria": "AFC", "Lebanon": "AFC",
+    "North Korea": "AFC", "Kyrgyzstan": "AFC", "Palestine": "AFC",
+    # CAF
+    "Morocco": "CAF", "Senegal": "CAF", "Egypt": "CAF", "Tunisia": "CAF",
+    "Algeria": "CAF", "Nigeria": "CAF", "Cameroon": "CAF", "Ghana": "CAF",
+    "Ivory Coast": "CAF", "Mali": "CAF", "Cape Verde": "CAF", "South Africa": "CAF",
+    "Burkina Faso": "CAF", "DR Congo": "CAF", "Guinea": "CAF", "Zambia": "CAF",
+    "Angola": "CAF", "Uganda": "CAF", "Gabon": "CAF", "Benin": "CAF",
+    "Equatorial Guinea": "CAF", "Mozambique": "CAF", "Mauritania": "CAF",
+    "Sudan": "CAF", "Madagascar": "CAF",
+    # OFC
+    "New Zealand": "OFC", "New Caledonia": "OFC", "Tahiti": "OFC", "Fiji": "OFC",
+    "Solomon Islands": "OFC", "Vanuatu": "OFC", "Papua New Guinea": "OFC",
+}
+CONFED_LIST = ["UEFA", "CONMEBOL", "CONCACAF", "AFC", "CAF", "OFC"]
+
+
+def confederation_of(team):
+    return CONFEDERATIONS.get(team)
+
+
+def fit_confederation_offsets(results_df, ratings, lookback_years=8, as_of=None,
+                              max_offset=200.0, iters=400, lr=2.0):
+    """
+    Estimate a per-confederation Elo offset from CROSS-confederation matches only
+    (where the closed-pool bias actually shows up). The offset for a confederation
+    is added to its teams' ratings so that inter-confederation results become
+    unbiased on average. UEFA is pinned to 0 as the reference.
+
+    Returns a dict {confederation: elo_offset}.
+    """
+    if as_of is None:
+        as_of = results_df["date"].max()
+    cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=int(lookback_years * 365.25))
+
+    # gather recent inter-confederation matches
+    rows = []
+    for row in results_df.itertuples(index=False):
+        if pd.Timestamp(row.date) < cutoff:
+            continue
+        ch = confederation_of(row.home_team)
+        ca = confederation_of(row.away_team)
+        if ch is None or ca is None or ch == ca:
+            continue
+        if pd.isna(row.home_score) or pd.isna(row.away_score):
+            continue
+        if row.home_score > row.away_score:
+            actual = 1.0
+        elif row.home_score < row.away_score:
+            actual = 0.0
+        else:
+            actual = 0.5
+        adj = 0.0 if _is_neutral(row.neutral) else HOME_ADVANTAGE_DEFAULT
+        rows.append((ch, ca,
+                     ratings.get(row.home_team, BASE_RATING) + adj,
+                     ratings.get(row.away_team, BASE_RATING),
+                     actual))
+
+    offsets = {c: 0.0 for c in CONFED_LIST}
+    if not rows:
+        return offsets
+
+    # gradient descent: push each confederation's offset until its inter-conf
+    # results are predicted without bias
+    for _ in range(iters):
+        grad = {c: 0.0 for c in CONFED_LIST}
+        for ch, ca, rh, ra, actual in rows:
+            exp = expected_score(rh + offsets.get(ch, 0.0), ra + offsets.get(ca, 0.0))
+            resid = actual - exp                      # >0 => home conf underrated
+            grad[ch] = grad.get(ch, 0.0) + resid
+            grad[ca] = grad.get(ca, 0.0) - resid
+        for c in CONFED_LIST:
+            offsets[c] += lr * grad[c] / len(rows)
+        # pin UEFA = 0 (reference) and clamp
+        base = offsets["UEFA"]
+        for c in CONFED_LIST:
+            offsets[c] = float(np.clip(offsets[c] - base, -max_offset, max_offset))
+    return offsets
+
+
+def apply_confederation_offsets(ratings, offsets):
+    """Return a new ratings dict with each team's confederation offset added."""
+    if not offsets:
+        return dict(ratings)
+    out = {}
+    for team, r in ratings.items():
+        out[team] = r + offsets.get(confederation_of(team), 0.0)
+    return out
+
+
 
 # ---------------------------------------------------------------------------
 # PHASE 1: DATA
@@ -124,17 +264,27 @@ def update_elo(home_elo, away_elo, home_score, away_score,
     return home_elo + delta, away_elo - delta  # zero-sum
 
 
-def compute_elo(results_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
+def compute_elo(results_df, home_advantage=HOME_ADVANTAGE_DEFAULT,
+                half_life=None):
     """
     Walk completed matches in date order; return current ratings + match counts.
+    Before each match, a team's rating is pulled toward neutral based on how long
+    since it last played (2-year half-life), so stale form fades and recent form
+    dominates. This is point-in-time correct (no future leakage).
         ratings[team] = float
         counts[team]  = int  (< 30 => provisional, trust less)
     """
-    ratings, counts = {}, {}
+    ratings, counts, last_date = {}, {}, {}
     for row in results_df.itertuples(index=False):
         home, away = row.home_team, row.away_team
         rh = ratings.get(home, BASE_RATING)
         ra = ratings.get(away, BASE_RATING)
+
+        # decay toward the mean by time since each team last played
+        if home in last_date:
+            rh = _regress_to_mean(rh, (row.date - last_date[home]).days, half_life)
+        if away in last_date:
+            ra = _regress_to_mean(ra, (row.date - last_date[away]).days, half_life)
 
         new_rh, new_ra = update_elo(
             rh, ra, row.home_score, row.away_score,
@@ -145,6 +295,7 @@ def compute_elo(results_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
         ratings[home], ratings[away] = new_rh, new_ra
         counts[home] = counts.get(home, 0) + 1
         counts[away] = counts.get(away, 0) + 1
+        last_date[home] = last_date[away] = row.date
     return ratings, counts
 
 
@@ -201,48 +352,61 @@ def _dc_tau(hg, ag, lh, la, rho):
     return tau
 
 
-def _build_fit_arrays(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
-    """Walk Elo point-in-time and return arrays (d, venue, home_goals, away_goals)."""
-    ratings = {}
-    d_list, venue_list, hg_list, ag_list = [], [], [], []
+def _build_fit_arrays(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT,
+                      half_life=None, as_of=None):
+    """
+    Walk Elo point-in-time (with recency regression) and return arrays
+    (d, venue, home_goals, away_goals, weight). `weight` down-weights older
+    matches in the likelihood so the fit reflects current football.
+    """
+    if as_of is None:
+        as_of = train_df["date"].max()
+    ratings, last_date = {}, {}
+    d_list, venue_list, hg_list, ag_list, w_list = [], [], [], [], []
     for row in train_df.itertuples(index=False):
         h, a = row.home_team, row.away_team
         rh = ratings.get(h, BASE_RATING)
         ra = ratings.get(a, BASE_RATING)
+        if h in last_date:
+            rh = _regress_to_mean(rh, (row.date - last_date[h]).days, half_life)
+        if a in last_date:
+            ra = _regress_to_mean(ra, (row.date - last_date[a]).days, half_life)
         neutral = _is_neutral(row.neutral)
 
         d_list.append((rh - ra) / 100.0)          # venue-neutral strength gap
         venue_list.append(0.0 if neutral else 1.0)
         hg_list.append(int(row.home_score))
         ag_list.append(int(row.away_score))
+        w_list.append(_recency_weight(row.date, as_of, half_life))
 
         new_rh, new_ra = update_elo(rh, ra, row.home_score, row.away_score,
                                     tournament=row.tournament, neutral=neutral,
                                     home_advantage=home_advantage)
         ratings[h], ratings[a] = new_rh, new_ra
-    return (np.array(d_list), np.array(venue_list),
-            np.array(hg_list), np.array(ag_list))
+        last_date[h] = last_date[a] = row.date
+    return (np.array(d_list), np.array(venue_list), np.array(hg_list),
+            np.array(ag_list), np.array(w_list))
 
 
-def _scoreline_nll(theta, d, venue, hg, ag):
-    """Negative log-likelihood of the Dixon-Coles + Elo-covariate model."""
+def _scoreline_nll(theta, d, venue, hg, ag, w):
+    """Recency-weighted negative log-likelihood of the Dixon-Coles model."""
     a_, b_, h_, rho_ = theta
     lh = np.exp(a_ + b_ * d + h_ * venue)
     la = np.exp(a_ - b_ * d)
     tau = np.maximum(_dc_tau(hg, ag, lh, la, rho_), 1e-10)
     ll = _poisson_logpmf(hg, lh) + _poisson_logpmf(ag, la) + np.log(tau)
-    return -np.sum(ll)
+    return -np.sum(w * ll)
 
 
 def fit_scoreline_model(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
     """
-    Fit the Dixon-Coles + Elo-covariate goals model by maximum likelihood.
+    Fit the recency-weighted Dixon-Coles + Elo-covariate goals model by MLE.
     Returns a params dict {a, b, h, rho} for use with predict_scoreline().
     """
-    d, venue, hg, ag = _build_fit_arrays(train_df, home_advantage)
+    d, venue, hg, ag, w = _build_fit_arrays(train_df, home_advantage)
     x0 = np.array([0.2, 0.3, 0.25, -0.05])
     bounds = [(-1.0, 1.0), (0.0, 2.0), (-0.5, 1.0), (-0.2, 0.2)]
-    res = minimize(_scoreline_nll, x0, args=(d, venue, hg, ag),
+    res = minimize(_scoreline_nll, x0, args=(d, venue, hg, ag, w),
                    method="L-BFGS-B", bounds=bounds)
     a_, b_, h_, rho_ = res.x
     return {"a": float(a_), "b": float(b_), "h": float(h_), "rho": float(rho_)}
@@ -272,14 +436,14 @@ def fit_scoreline_model_with_cov(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT
     prediction by sampling plausible parameter values.
     Returns (params_dict, cov 4x4 array, param_order list).
     """
-    d, venue, hg, ag = _build_fit_arrays(train_df, home_advantage)
+    d, venue, hg, ag, w = _build_fit_arrays(train_df, home_advantage)
     x0 = np.array([0.2, 0.3, 0.25, -0.05])
     bounds = [(-1.0, 1.0), (0.0, 2.0), (-0.5, 1.0), (-0.2, 0.2)]
-    res = minimize(_scoreline_nll, x0, args=(d, venue, hg, ag),
+    res = minimize(_scoreline_nll, x0, args=(d, venue, hg, ag, w),
                    method="L-BFGS-B", bounds=bounds)
     theta = res.x
 
-    H = _numeric_hessian(lambda t: _scoreline_nll(t, d, venue, hg, ag), theta)
+    H = _numeric_hessian(lambda t: _scoreline_nll(t, d, venue, hg, ag, w), theta)
     try:
         cov = np.linalg.inv(H)
     except np.linalg.LinAlgError:
@@ -352,7 +516,8 @@ def match_probabilities_dc(r_home, r_away, params, neutral=True):
 
 def predict_with_inference(r_home, r_away, params, cov, neutral=True,
                            home_name="Home", away_name="Away",
-                           n_samples=3000, ci=0.95, seed=0, max_goals=10):
+                           n_samples=3000, ci=0.95, seed=0, max_goals=10,
+                           bet_threshold=0.65):
     """
     Predict a match AND quantify how sure we are, separating the two kinds of
     uncertainty:
@@ -427,6 +592,31 @@ def predict_with_inference(r_home, r_away, params, cov, neutral=True,
     margin_hi = int(m_sorted[np.searchsorted(cdf, hi_q)])
     best = np.unravel_index(np.argmax(matrix0), matrix0.shape)
 
+    # Bet rule: recommend only when ALL hold --
+    #   (1) lower end of the win-prob CI is above the threshold
+    #   (2) point-estimate win prob is above the threshold
+    #   (3) a draw isn't too likely (p_draw < 0.25)
+    #   (4) the strength gap is statistically significant (p < 0.05)
+    cond_ci = prob_ci[0] > bet_threshold
+    cond_point = winner_prob > bet_threshold
+    cond_draw = p_draw < 0.25
+    cond_sig = p_value < 0.05
+    recommend_bet = (winner != "Draw") and cond_ci and cond_point and cond_draw and cond_sig
+
+    too_close = (not recommend_bet) and (0.45 <= winner_prob < bet_threshold)
+
+    if recommend_bet:
+        bet_reason = (f"{winner} win prob {winner_prob:.0%} (CI low {prob_ci[0]:.0%}) "
+                      f"clears {bet_threshold:.0%}")
+    elif winner == "Draw" or not cond_draw:
+        bet_reason = "No bet - draw too likely"
+    elif too_close or not cond_point or not cond_ci:
+        bet_reason = "No bet - too close to call"
+    elif not cond_sig:
+        bet_reason = "No bet - teams not statistically distinguishable"
+    else:
+        bet_reason = "No bet"
+
     return {
         "home_name": home_name, "away_name": away_name,
         "winner": winner,
@@ -434,6 +624,10 @@ def predict_with_inference(r_home, r_away, params, cov, neutral=True,
         "prob_ci": prob_ci,
         "p_value": p_value,
         "significant": p_value < 0.05,
+        "recommend_bet": recommend_bet,
+        "too_close": too_close,
+        "bet_reason": bet_reason,
+        "bet_threshold": bet_threshold,
         "p_home": p_home, "p_draw": p_draw, "p_away": p_away,
         "exp_home_goals": lh0, "exp_away_goals": la0,
         "likely_score": (int(best[0]), int(best[1])),
@@ -709,16 +903,18 @@ def _max_drawdown(series):
 # ---------------------------------------------------------------------------
 
 def tournament_accuracy(results_df, params, tournament="FIFA World Cup", year=None,
-                        home_advantage=HOME_ADVANTAGE_DEFAULT):
+                        home_advantage=HOME_ADVANTAGE_DEFAULT,
+                        half_life=None, conf_offsets=None):
     """
     Walk completed matches in date order (point-in-time, no lookahead) and, for
     every match in the chosen tournament/year, predict the team more likely to
-    win and check whether it actually won.
+    win and check whether it actually won. Uses the same recency-decayed ratings
+    and confederation offsets as the live predictor.
 
     A draw counts as a miss (we predicted a team to win, nobody did).
     Returns: n (matches), correct, win_pct, and a per-match `rows` list.
     """
-    ratings = {}
+    ratings, last_date = {}, {}
     n = correct = 0
     rows = []
 
@@ -726,12 +922,22 @@ def tournament_accuracy(results_df, params, tournament="FIFA World Cup", year=No
         h, a = row.home_team, row.away_team
         rh = ratings.get(h, BASE_RATING)
         ra = ratings.get(a, BASE_RATING)
+        if h in last_date:
+            rh = _regress_to_mean(rh, (row.date - last_date[h]).days, half_life)
+        if a in last_date:
+            ra = _regress_to_mean(ra, (row.date - last_date[a]).days, half_life)
         neutral = _is_neutral(row.neutral)
 
         in_scope = (row.tournament == tournament and
                     (year is None or pd.Timestamp(row.date).year == year))
         if in_scope:
-            ph, _pd, pa = match_probabilities_dc(rh, ra, params, neutral=neutral)
+            # apply confederation offsets to the rating gap used for prediction
+            if conf_offsets:
+                rh_adj = rh + conf_offsets.get(confederation_of(h), 0.0)
+                ra_adj = ra + conf_offsets.get(confederation_of(a), 0.0)
+            else:
+                rh_adj, ra_adj = rh, ra
+            ph, _pd, pa = match_probabilities_dc(rh_adj, ra_adj, params, neutral=neutral)
             predicted = h if ph >= pa else a
 
             if row.home_score > row.away_score:
@@ -755,6 +961,7 @@ def tournament_accuracy(results_df, params, tournament="FIFA World Cup", year=No
                                     tournament=row.tournament, neutral=neutral,
                                     home_advantage=home_advantage)
         ratings[h], ratings[a] = new_rh, new_ra
+        last_date[h] = last_date[a] = row.date
 
     return {
         "n": n, "correct": correct,
@@ -797,25 +1004,27 @@ if __name__ == "__main__":
               f"  (xG {r['exp_home_goals']:.1f}-{r['exp_away_goals']:.1f})")
 
     print("=" * 60)
-    print("INFERENCE: probability, confidence interval, p-value")
+    print("CONFEDERATION ADJUSTMENT (data-driven offsets)")
+    offsets = fit_confederation_offsets(train, ratings)
+    for c in CONFED_LIST:
+        print(f"  {c:10s} {offsets[c]:+6.1f} Elo")
+    radj = apply_confederation_offsets(ratings, offsets)
+
+    print("=" * 60)
+    print("INFERENCE + bet rule (65% threshold, confederation-adjusted)")
     _params, _cov, _ = fit_scoreline_model_with_cov(train)
     for h, a in [("Spain", "Cape Verde"), ("Belgium", "Egypt")]:
-        res = predict_with_inference(ratings[h], ratings[a], _params, _cov,
+        res = predict_with_inference(radj[h], radj[a], _params, _cov,
                                      neutral=True, home_name=h, away_name=a)
         lo, hi = res["prob_ci"]
-        pv = "<0.001" if res["p_value"] < 0.001 else f"{res['p_value']:.3f}"
-        print(f"  {h} vs {a}: winner={res['winner']}  P(win)={res['winner_prob']:.0%}"
-              f"  95% CI=[{lo:.0%},{hi:.0%}]  p={pv}"
-              f"  ({'significant' if res['significant'] else 'not significant'})")
+        flag = ("BET " + res["winner"]) if res["recommend_bet"] else (
+            "TOO CLOSE" if res["too_close"] else "NO BET")
+        print(f"  {h} vs {a}: winner={res['winner']} P(win)={res['winner_prob']:.0%}"
+              f" CI=[{lo:.0%},{hi:.0%}] -> {flag}")
 
     print("=" * 60)
-    print("PHASE 6: Kelly")
-    print(f"  single_kelly(0.55, 2.10) = {single_kelly(0.55, 2.10):.4f}  (expect 0.1409)")
-
-    print("=" * 60)
-    print("PHASE 7: backtest on historical World Cup matches (synthetic odds)")
-    bt = backtest(train, kelly_fraction=0.5)
-    print(f"  bets placed : {bt['n_bets']}")
-    print(f"  win rate    : {bt['win_rate']:.1f}%")
-    print(f"  final return: {bt['final_pct']:+.1f}%   (synthetic odds -> expect near 0 / slightly negative)")
-    print(f"  max drawdown: {bt['max_drawdown']:.1f}%")
+    print("ACCURACY (flat ratings + confederation adjustment = shipped model)")
+    acc_all = tournament_accuracy(train, _params, year=None, conf_offsets=offsets)
+    acc_26 = tournament_accuracy(train, _params, year=2026, conf_offsets=offsets)
+    print(f"  all-time WC: {acc_all['win_pct']:.1f}% ({acc_all['correct']}/{acc_all['n']})")
+    print(f"  2026 WC:     {acc_26['win_pct']:.1f}% ({acc_26['correct']}/{acc_26['n']})")

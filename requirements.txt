@@ -1,6 +1,6 @@
-streamlit
-pandas
-numpy
-cvxpy
-requests
-scipy
+streamlit>=1.40
+pandas>=2.0
+numpy>=1.24
+scipy>=1.11
+cvxpy>=1.5
+requests>=2.31
