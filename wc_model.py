@@ -201,15 +201,10 @@ def _dc_tau(hg, ag, lh, la, rho):
     return tau
 
 
-def fit_scoreline_model(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
-    """
-    Fit the Dixon-Coles + Elo-covariate goals model by maximum likelihood.
-    Walks Elo point-in-time so each match's covariate uses only prior info.
-    Returns a params dict {a, b, h, rho} for use with predict_scoreline().
-    """
+def _build_fit_arrays(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
+    """Walk Elo point-in-time and return arrays (d, venue, home_goals, away_goals)."""
     ratings = {}
     d_list, venue_list, hg_list, ag_list = [], [], [], []
-
     for row in train_df.itertuples(index=False):
         h, a = row.home_team, row.away_team
         rh = ratings.get(h, BASE_RATING)
@@ -225,23 +220,108 @@ def fit_scoreline_model(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
                                     tournament=row.tournament, neutral=neutral,
                                     home_advantage=home_advantage)
         ratings[h], ratings[a] = new_rh, new_ra
+    return (np.array(d_list), np.array(venue_list),
+            np.array(hg_list), np.array(ag_list))
 
-    d = np.array(d_list); venue = np.array(venue_list)
-    hg = np.array(hg_list); ag = np.array(ag_list)
 
-    def neg_log_likelihood(theta):
-        a_, b_, h_, rho_ = theta
-        lh = np.exp(a_ + b_ * d + h_ * venue)
-        la = np.exp(a_ - b_ * d)
-        tau = np.maximum(_dc_tau(hg, ag, lh, la, rho_), 1e-10)
-        ll = _poisson_logpmf(hg, lh) + _poisson_logpmf(ag, la) + np.log(tau)
-        return -np.sum(ll)
+def _scoreline_nll(theta, d, venue, hg, ag):
+    """Negative log-likelihood of the Dixon-Coles + Elo-covariate model."""
+    a_, b_, h_, rho_ = theta
+    lh = np.exp(a_ + b_ * d + h_ * venue)
+    la = np.exp(a_ - b_ * d)
+    tau = np.maximum(_dc_tau(hg, ag, lh, la, rho_), 1e-10)
+    ll = _poisson_logpmf(hg, lh) + _poisson_logpmf(ag, la) + np.log(tau)
+    return -np.sum(ll)
 
+
+def fit_scoreline_model(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
+    """
+    Fit the Dixon-Coles + Elo-covariate goals model by maximum likelihood.
+    Returns a params dict {a, b, h, rho} for use with predict_scoreline().
+    """
+    d, venue, hg, ag = _build_fit_arrays(train_df, home_advantage)
     x0 = np.array([0.2, 0.3, 0.25, -0.05])
     bounds = [(-1.0, 1.0), (0.0, 2.0), (-0.5, 1.0), (-0.2, 0.2)]
-    res = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds)
+    res = minimize(_scoreline_nll, x0, args=(d, venue, hg, ag),
+                   method="L-BFGS-B", bounds=bounds)
     a_, b_, h_, rho_ = res.x
     return {"a": float(a_), "b": float(b_), "h": float(h_), "rho": float(rho_)}
+
+
+def _numeric_hessian(f, x, eps=1e-4):
+    """Finite-difference Hessian of scalar f at x (small dimension only)."""
+    n = len(x)
+    H = np.zeros((n, n))
+    fx = f(x)
+    for i in range(n):
+        for j in range(i, n):
+            xi, xj, xij = x.copy(), x.copy(), x.copy()
+            xi[i] += eps
+            xj[j] += eps
+            xij[i] += eps
+            xij[j] += eps
+            H[i, j] = H[j, i] = (f(xij) - f(xi) - f(xj) + fx) / (eps * eps)
+    return H
+
+
+def fit_scoreline_model_with_cov(train_df, home_advantage=HOME_ADVANTAGE_DEFAULT):
+    """
+    Like fit_scoreline_model, but also returns the parameter covariance matrix
+    (inverse observed Fisher information = inverse Hessian of the NLL at the MLE).
+    This covariance is what lets us put a confidence interval / p-value on a
+    prediction by sampling plausible parameter values.
+    Returns (params_dict, cov 4x4 array, param_order list).
+    """
+    d, venue, hg, ag = _build_fit_arrays(train_df, home_advantage)
+    x0 = np.array([0.2, 0.3, 0.25, -0.05])
+    bounds = [(-1.0, 1.0), (0.0, 2.0), (-0.5, 1.0), (-0.2, 0.2)]
+    res = minimize(_scoreline_nll, x0, args=(d, venue, hg, ag),
+                   method="L-BFGS-B", bounds=bounds)
+    theta = res.x
+
+    H = _numeric_hessian(lambda t: _scoreline_nll(t, d, venue, hg, ag), theta)
+    try:
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(H)
+    # numerical guard: symmetrise and nudge to positive semi-definite
+    cov = (cov + cov.T) / 2.0
+
+    params = {"a": float(theta[0]), "b": float(theta[1]),
+              "h": float(theta[2]), "rho": float(theta[3])}
+    return params, cov, ["a", "b", "h", "rho"]
+
+
+
+
+def _score_matrix(lh, la, rho, max_goals=10):
+    """Dixon-Coles probability matrix where matrix[i, j] = P(home i, away j)."""
+    i = np.arange(0, max_goals + 1)
+    ph = np.exp(_poisson_logpmf(i, lh))
+    pa = np.exp(_poisson_logpmf(i, la))
+    matrix = np.outer(ph, pa)
+    matrix[0, 0] *= 1.0 - lh * la * rho
+    matrix[0, 1] *= 1.0 + lh * rho
+    matrix[1, 0] *= 1.0 + la * rho
+    matrix[1, 1] *= 1.0 - rho
+    matrix = np.maximum(matrix, 0.0)
+    return matrix / matrix.sum()
+
+
+def _lambdas(r_home, r_away, params, neutral):
+    """Expected goals for home and away from the fitted model."""
+    d = (r_home - r_away) / 100.0
+    venue = 0.0 if neutral else 1.0
+    lh = float(np.exp(params["a"] + params["b"] * d + params["h"] * venue))
+    la = float(np.exp(params["a"] - params["b"] * d))
+    return lh, la
+
+
+def _hda_from_matrix(matrix):
+    p_home = float(np.tril(matrix, -1).sum())   # home goals > away goals
+    p_away = float(np.triu(matrix, 1).sum())    # away goals > home goals
+    p_draw = float(np.trace(matrix))
+    return p_home, p_draw, p_away
 
 
 def predict_scoreline(r_home, r_away, params, neutral=True, max_goals=10):
@@ -249,29 +329,10 @@ def predict_scoreline(r_home, r_away, params, neutral=True, max_goals=10):
     Full prediction from the fitted goals model. Returns a dict with H/D/A
     probabilities, expected goals for each side, and the most likely scoreline.
     """
-    d = (r_home - r_away) / 100.0
-    venue = 0.0 if neutral else 1.0
-    lh = float(np.exp(params["a"] + params["b"] * d + params["h"] * venue))
-    la = float(np.exp(params["a"] - params["b"] * d))
-
-    i = np.arange(0, max_goals + 1)
-    ph = np.exp(_poisson_logpmf(i, lh))           # P(home scores i)
-    pa = np.exp(_poisson_logpmf(i, la))           # P(away scores j)
-    matrix = np.outer(ph, pa)                     # matrix[i, j]
-
-    rho = params["rho"]
-    matrix[0, 0] *= 1.0 - lh * la * rho
-    matrix[0, 1] *= 1.0 + lh * rho
-    matrix[1, 0] *= 1.0 + la * rho
-    matrix[1, 1] *= 1.0 - rho
-    matrix = np.maximum(matrix, 0.0)
-    matrix /= matrix.sum()
-
-    p_home = float(np.tril(matrix, -1).sum())     # home goals > away goals
-    p_away = float(np.triu(matrix, 1).sum())      # away goals > home goals
-    p_draw = float(np.trace(matrix))
+    lh, la = _lambdas(r_home, r_away, params, neutral)
+    matrix = _score_matrix(lh, la, params["rho"], max_goals)
+    p_home, p_draw, p_away = _hda_from_matrix(matrix)
     best = np.unravel_index(np.argmax(matrix), matrix.shape)
-
     return {
         "p_home": p_home, "p_draw": p_draw, "p_away": p_away,
         "exp_home_goals": lh, "exp_away_goals": la,
@@ -283,6 +344,102 @@ def match_probabilities_dc(r_home, r_away, params, neutral=True):
     """Drop-in (P_home, P_draw, P_away) from the Dixon-Coles model."""
     r = predict_scoreline(r_home, r_away, params, neutral=neutral)
     return r["p_home"], r["p_draw"], r["p_away"]
+
+
+# ---------------------------------------------------------------------------
+# STATISTICAL INFERENCE: confidence interval, probability, p-value
+# ---------------------------------------------------------------------------
+
+def predict_with_inference(r_home, r_away, params, cov, neutral=True,
+                           home_name="Home", away_name="Away",
+                           n_samples=3000, ci=0.95, seed=0, max_goals=10):
+    """
+    Predict a match AND quantify how sure we are, separating the two kinds of
+    uncertainty:
+
+    ESTIMATION uncertainty (how well we know the probabilities) -- by drawing
+    parameter vectors from N(theta_hat, cov) and recomputing the prediction:
+        - winner, winner_prob (point estimate)
+        - prob_ci             : confidence interval on the winner's win probability
+        - p_value             : two-sided test of H0 'teams evenly matched'
+                                (expected goal supremacy == 0); significant<0.05
+                                means the favourite is genuinely stronger
+
+    OUTCOME uncertainty (how random the match is, even with perfect knowledge):
+        - p_home/p_draw/p_away, likely_score
+        - margin_interval     : predictive interval on goal margin (home - away)
+
+    Returns one dict with everything.
+    """
+    rng = np.random.default_rng(seed)
+    lo_q = (1.0 - ci) / 2.0
+    hi_q = 1.0 - lo_q
+
+    # --- point estimate ---
+    lh0, la0 = _lambdas(r_home, r_away, params, neutral)
+    matrix0 = _score_matrix(lh0, la0, params["rho"], max_goals)
+    p_home, p_draw, p_away = _hda_from_matrix(matrix0)
+    labels = [home_name, "Draw", away_name]
+    point = [p_home, p_draw, p_away]
+    win_idx = int(np.argmax(point))
+    winner = labels[win_idx]
+    winner_prob = point[win_idx]
+    supremacy_hat = lh0 - la0
+
+    # --- estimation uncertainty: sample parameters ---
+    theta_hat = np.array([params["a"], params["b"], params["h"], params["rho"]])
+    try:
+        draws = rng.multivariate_normal(theta_hat, cov, size=n_samples)
+    except Exception:
+        draws = np.repeat(theta_hat[None, :], n_samples, axis=0)
+
+    d = (r_home - r_away) / 100.0
+    venue = 0.0 if neutral else 1.0
+    winner_probs, supremacies = [], []
+    for a_, b_, h_, rho_ in draws:
+        lh = np.exp(a_ + b_ * d + h_ * venue)
+        la = np.exp(a_ - b_ * d)
+        mat = _score_matrix(lh, la, rho_, max_goals)
+        winner_probs.append(_hda_from_matrix(mat)[win_idx])
+        supremacies.append(lh - la)
+    winner_probs = np.array(winner_probs)
+    supremacies = np.array(supremacies)
+
+    prob_ci = (float(np.quantile(winner_probs, lo_q)),
+               float(np.quantile(winner_probs, hi_q)))
+
+    # two-sided p-value for H0: supremacy == 0 (teams evenly matched)
+    if supremacy_hat >= 0:
+        p_value = 2.0 * float(np.mean(supremacies <= 0.0))
+    else:
+        p_value = 2.0 * float(np.mean(supremacies >= 0.0))
+    p_value = min(1.0, p_value)
+
+    # --- outcome uncertainty: predictive interval on goal margin ---
+    g = np.arange(0, max_goals + 1)
+    margins = g[:, None] - g[None, :]          # margin for each (i, j)
+    flat_m = margins.ravel()
+    flat_p = matrix0.ravel()
+    order = np.argsort(flat_m)
+    m_sorted, p_sorted = flat_m[order], flat_p[order]
+    cdf = np.cumsum(p_sorted)
+    margin_lo = int(m_sorted[np.searchsorted(cdf, lo_q)])
+    margin_hi = int(m_sorted[np.searchsorted(cdf, hi_q)])
+    best = np.unravel_index(np.argmax(matrix0), matrix0.shape)
+
+    return {
+        "home_name": home_name, "away_name": away_name,
+        "winner": winner,
+        "winner_prob": winner_prob,
+        "prob_ci": prob_ci,
+        "p_value": p_value,
+        "significant": p_value < 0.05,
+        "p_home": p_home, "p_draw": p_draw, "p_away": p_away,
+        "exp_home_goals": lh0, "exp_away_goals": la0,
+        "likely_score": (int(best[0]), int(best[1])),
+        "margin_interval": (margin_lo, margin_hi),
+        "ci_level": ci,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +736,18 @@ if __name__ == "__main__":
         print(f"  {h} vs {a}: H={r['p_home']:.0%} D={r['p_draw']:.0%} A={r['p_away']:.0%}"
               f"  | likely score {r['likely_score'][0]}-{r['likely_score'][1]}"
               f"  (xG {r['exp_home_goals']:.1f}-{r['exp_away_goals']:.1f})")
+
+    print("=" * 60)
+    print("INFERENCE: probability, confidence interval, p-value")
+    _params, _cov, _ = fit_scoreline_model_with_cov(train)
+    for h, a in [("Spain", "Cape Verde"), ("Belgium", "Egypt")]:
+        res = predict_with_inference(ratings[h], ratings[a], _params, _cov,
+                                     neutral=True, home_name=h, away_name=a)
+        lo, hi = res["prob_ci"]
+        pv = "<0.001" if res["p_value"] < 0.001 else f"{res['p_value']:.3f}"
+        print(f"  {h} vs {a}: winner={res['winner']}  P(win)={res['winner_prob']:.0%}"
+              f"  95% CI=[{lo:.0%},{hi:.0%}]  p={pv}"
+              f"  ({'significant' if res['significant'] else 'not significant'})")
 
     print("=" * 60)
     print("PHASE 6: Kelly")
