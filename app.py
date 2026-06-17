@@ -31,12 +31,20 @@ def load_model(home_advantage):
     train = m.get_training_data(df)
     ratings, _ = m.compute_elo(train, home_advantage=home_advantage)
     params, cov, _ = m.fit_scoreline_model_with_cov(train, home_advantage=home_advantage)
-    return df, ratings, params, cov
+    return df, train, ratings, params, cov
+
+
+@st.cache_data(ttl=1800, show_spinner="Scoring the model's track record...")
+def accuracy(home_advantage):
+    _df, train, _ratings, params, _cov = load_model(home_advantage)
+    current = m.tournament_accuracy(train, params, year=2026, home_advantage=home_advantage)
+    all_time = m.tournament_accuracy(train, params, year=None, home_advantage=home_advantage)
+    return current, all_time
 
 
 @st.cache_data(ttl=1800, show_spinner="Running inference...")
 def predictions_for(home_advantage, ci, day_str):
-    df, ratings, params, cov = load_model(home_advantage)
+    df, train, ratings, params, cov = load_model(home_advantage)
     fixtures = m.get_fixtures_for_date(df, day_str)
     out, skipped = [], []
     for r in fixtures.itertuples(index=False):
@@ -72,7 +80,25 @@ if st.sidebar.button("Refresh data"):
 st.title("⚽ World Cup 2026 — Who Wins, and How Sure Are We?")
 st.caption("Win probability, a confidence interval, and a significance test for each match.")
 
-df, ratings, params, cov = load_model(float(home_adv))
+df, train, ratings, params, cov = load_model(float(home_adv))
+
+# --- model win rate, shown at the top ---
+current, all_time = accuracy(float(home_adv))
+if current["n"]:
+    st.metric("Model win rate — 2026 World Cup",
+              f"{current['win_pct']:.0f}%",
+              help="Share of completed 2026 World Cup matches where the model's "
+                   "predicted winner actually won. Draws count as misses.")
+    st.caption(f"Correctly predicted the winner in **{current['correct']} of "
+               f"{current['n']}** completed matches so far. "
+               f"For context, across all {all_time['n']} World Cup matches in history "
+               f"the model is right {all_time['win_pct']:.0f}% of the time.")
+else:
+    st.metric("Model win rate — World Cup (all-time)", f"{all_time['win_pct']:.0f}%",
+              help="Share of historical World Cup matches the model called correctly.")
+    st.caption(f"No completed 2026 matches yet — this is across all {all_time['n']} "
+               f"World Cup matches in history.")
+
 today = dt.date(2026, 6, 15)            # live site: dt.date.today()
 
 if not m.get_fixtures_for_date(df, today).empty:

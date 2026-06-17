@@ -705,6 +705,65 @@ def _max_drawdown(series):
 
 
 # ---------------------------------------------------------------------------
+# PREDICTION ACCURACY  (how often the predicted winner actually won)
+# ---------------------------------------------------------------------------
+
+def tournament_accuracy(results_df, params, tournament="FIFA World Cup", year=None,
+                        home_advantage=HOME_ADVANTAGE_DEFAULT):
+    """
+    Walk completed matches in date order (point-in-time, no lookahead) and, for
+    every match in the chosen tournament/year, predict the team more likely to
+    win and check whether it actually won.
+
+    A draw counts as a miss (we predicted a team to win, nobody did).
+    Returns: n (matches), correct, win_pct, and a per-match `rows` list.
+    """
+    ratings = {}
+    n = correct = 0
+    rows = []
+
+    for row in results_df.itertuples(index=False):
+        h, a = row.home_team, row.away_team
+        rh = ratings.get(h, BASE_RATING)
+        ra = ratings.get(a, BASE_RATING)
+        neutral = _is_neutral(row.neutral)
+
+        in_scope = (row.tournament == tournament and
+                    (year is None or pd.Timestamp(row.date).year == year))
+        if in_scope:
+            ph, _pd, pa = match_probabilities_dc(rh, ra, params, neutral=neutral)
+            predicted = h if ph >= pa else a
+
+            if row.home_score > row.away_score:
+                actual = h
+            elif row.home_score < row.away_score:
+                actual = a
+            else:
+                actual = None  # draw
+
+            is_correct = predicted == actual
+            n += 1
+            correct += int(is_correct)
+            rows.append({
+                "Date": pd.Timestamp(row.date).date(),
+                "Match": f"{h} vs {a}",
+                "Predicted winner": predicted,
+                "Result": "Correct" if is_correct else ("Draw" if actual is None else "Wrong"),
+            })
+
+        new_rh, new_ra = update_elo(rh, ra, row.home_score, row.away_score,
+                                    tournament=row.tournament, neutral=neutral,
+                                    home_advantage=home_advantage)
+        ratings[h], ratings[a] = new_rh, new_ra
+
+    return {
+        "n": n, "correct": correct,
+        "win_pct": (correct / n * 100.0) if n else 0.0,
+        "rows": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CHECKPOINTS  -- run with: python wc_model.py
 # ---------------------------------------------------------------------------
 
